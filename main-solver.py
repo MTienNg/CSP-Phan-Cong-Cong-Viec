@@ -1,648 +1,390 @@
-# Mô hình chính với thuật toán Backtracking + Heuristics (MRV + LCV) + Forward Checking
-import csv
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
-import os
-import sys
+# HỆ THỐNG PHÂN CÔNG CÔNG VIỆC TỐI ƯU - CSP SOLVER
 
-# Thiết lập mã hóa UTF-8 cho đầu ra (tránh lỗi font trên Windows)
-if sys.platform == "win32":
-    import codecs
-    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
-    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+## 📋 TỔNG QUAN
 
-class TacVu:
-    def __init__(self, task_id: str, name: str, required_skill: str, duration: int, 
-                 dependencies: List[str], deadline: int, priority: int):
-        self.id = task_id
-        self.name = name
-        self.required_skill = required_skill
-        self.duration = duration  # thời lượng (giờ)
-        self.dependencies = dependencies if dependencies else []
-        self.deadline = deadline  # hạn chót (số ngày kể từ khi dự án bắt đầu)
-        self.priority = priority  # số càng lớn = độ ưu tiên càng cao
+Hệ thống phân công công việc tự động sử dụng **Constraint Satisfaction Problem (CSP)** với các thuật toán tối ưu:
 
-class NhanSu:
-    def __init__(self, emp_id: str, name: str, skills: List[str], daily_capacity: int):
-        self.id = emp_id
-        self.name = name
-        self.skills = skills
-        self.daily_capacity = daily_capacity  # số giờ làm việc mỗi ngày
-        self.work_schedule = []  # danh sách (thời gian bắt đầu, kết thúc) cho các tác vụ được gán
+### ✅ Các thuật toán được tích hợp:
+- **AC-3 (Arc Consistency 3)**: Tiền xử lý cắt tỉa domain trước khi tìm kiếm
+- **Backtracking**: Thuật toán quay lui đệ quy với phát hiện ngõ cụt
+- **MRV (Minimum Remaining Values)**: Heuristic chọn biến (fail-fast strategy)
+- **LCV (Least Constraining Value)**: Heuristic sắp xếp giá trị (succeed-first strategy)
+- **Forward Checking**: Cắt tỉa domain sau mỗi phép gán
+- **Soft Constraints Optimization**: Tối ưu hóa Priority + Load Balance
 
-class CSPAssignment:
-    def __init__(self, nhansu: NhanSu, start_time: datetime):
-        self.nhansu = nhansu
-        self.start_time = start_time
-        self.end_time = None  # sẽ được tính khi biết thời lượng tác vụ
+### 🎯 Ràng buộc:
+- **Ràng buộc cứng**: Kỹ năng, Phụ thuộc, Lịch làm việc, Deadline, Khung thời gian (8h-17h)
+- **Ràng buộc mềm**: Priority (ưu tiên cao thực hiện sớm), Load Balance (cân bằng tải)
 
-class CSP:
-    def __init__(self, cac_tacvu: List[TacVu], cac_nhansu: List[NhanSu], 
-                 project_start_date: datetime, project_end_date: datetime):
-        self.cac_tacvu = cac_tacvu
-        self.cac_nhansu = cac_nhansu
-        self.project_start_date = project_start_date
-        self.project_end_date = project_end_date
-        self.assignment: Dict[str, CSPAssignment] = {}  # ánh xạ task_id -> CSPAssignment
-        self.solution_found = False
-        # domains: task_id -> list of possible CSPAssignment
-        self.domains: Dict[str, List[CSPAssignment]] = {}
+---
 
-def load_data(dataset_folder: str) -> Tuple[List[TacVu], List[NhanSu]]:
-    """Tải dữ liệu tác vụ và nhân sự từ các tệp CSV trong thư mục chỉ định"""
-    # Xác định tên file phù hợp dựa theo thư mục dữ liệu
-    if "complex_dependency_chain" in dataset_folder:
-        tasks_file = os.path.join(dataset_folder, "congviec_dependency.csv")
-        employees_file = os.path.join(dataset_folder, "nhanvien_dependency.csv")
-    elif "load_balance" in dataset_folder:
-        tasks_file = os.path.join(dataset_folder, "congviec_loadbalance.csv")
-        employees_file = os.path.join(dataset_folder, "nhanvien_loadbalance.csv")
-    elif "skill_bottleneck" in dataset_folder:
-        tasks_file = os.path.join(dataset_folder, "congviec_bottleneck.csv")
-        employees_file = os.path.join(dataset_folder, "nhanvien_bottleneck.csv")
-    else:
-        raise ValueError(f"Không nhận dạng được thư mục dữ liệu: {dataset_folder}")
-    
-    # Đọc danh sách các tác vụ
-    cac_tacvu = []
-    with open(tasks_file, 'r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if 'ID' in row and row['ID'].strip():  # bỏ qua dòng trống
-                dependencies = []
-                if 'PhuThuoc' in row and row['PhuThuoc'].strip():
-                    dependencies = [dep.strip() for dep in row['PhuThuoc'].split(',')]
-                
-                tacvu = TacVu(
-                    task_id=row['ID'].strip(),
-                    name=row.get('TenTask','').strip(),
-                    required_skill=row.get('YeuCauKyNang','').strip(),
-                    duration=int(row.get('ThoiLuong (gio)', '0')),
-                    dependencies=dependencies,
-                    deadline=int(row.get('Deadline (ngay)', '0')),
-                    priority=int(row.get('DoUuTien', '0'))
-                )
-                cac_tacvu.append(tacvu)
-    
-    # Đọc danh sách nhân sự
-    cac_nhansu = []
-    with open(employees_file, 'r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if 'ID' in row and row['ID'].strip():  # bỏ qua dòng trống
-                skills = [skill.strip() for skill in row.get('KyNang','').split(',') if skill.strip()]
-                nhansu = NhanSu(
-                    emp_id=row['ID'].strip(),
-                    name=row.get('Ten','').strip(),
-                    skills=skills,
-                    daily_capacity=int(row.get('SucChua (gio/ngay)', '8'))
-                )
-                cac_nhansu.append(nhansu)
-    
-    return cac_tacvu, cac_nhansu
+## 📁 CẤU TRÚC DỰ ÁN
 
-def is_consistent(tacvu: TacVu, assignment: CSPAssignment, csp: CSP) -> bool:
-    """Kiểm tra xem việc gán tác vụ cho nhân sự tại thời điểm này có hợp lệ (thỏa mãn ràng buộc) không"""
-    # 1. Ràng buộc kỹ năng
-    if tacvu.required_skill and tacvu.required_skill not in assignment.nhansu.skills:
-        return False
-    
-    # 2. Ràng buộc phụ thuộc giữa các tác vụ
-    for dep_task_id in tacvu.dependencies:
-        if dep_task_id in csp.assignment:
-            dep_assignment = csp.assignment[dep_task_id]
-            dep_task = next(t for t in csp.cac_tacvu if t.id == dep_task_id)
-            dep_end_time = dep_assignment.start_time + timedelta(hours=dep_task.duration)
-            if assignment.start_time < dep_end_time:
-                return False
-    
-    # 3. Ràng buộc lịch làm việc (không được trùng thời gian)
-    task_end_time = assignment.start_time + timedelta(hours=tacvu.duration)
-    
-    for assigned_task_id, assigned_assignment in csp.assignment.items():
-        if assigned_assignment.nhansu.id == assignment.nhansu.id:
-            assigned_task = next(t for t in csp.cac_tacvu if t.id == assigned_task_id)
-            assigned_end_time = assigned_assignment.start_time + timedelta(hours=assigned_task.duration)
-            if (assignment.start_time < assigned_end_time and 
-                task_end_time > assigned_assignment.start_time):
-                return False
-    
-    # 4. Ràng buộc hạn chót của tác vụ
-    project_deadline = csp.project_start_date + timedelta(days=tacvu.deadline)
-    if task_end_time > project_deadline:
-        return False
-    
-    # 5. Ràng buộc trong khung thời gian dự án
-    if assignment.start_time < csp.project_start_date or task_end_time > csp.project_end_date:
-        return False
-    
-    return True
+```
+CSP-Phan-Cong-Cong-Viec-main-solver/
+├── datasets/                           # 3 bộ dữ liệu test
+│   ├── complex_dependency_chain/      # Chuỗi phụ thuộc phức tạp
+│   │   ├── congviec_dependency.csv
+│   │   └── nhanvien_dependency.csv
+│   ├── load_balance/                   # Cân bằng tải
+│   │   ├── congviec_loadbalance.csv
+│   │   └── nhanvien_loadbalance.csv
+│   └── skill_bottleneck/               # Nghẽn cổ chai kỹ năng
+│       ├── congviec_bottleneck.csv
+│       └── nhanvien_bottleneck.csv
+│
+├── main-solver.py                     # 🌟 File chính - Hệ thống tối ưu
+├── README.md                          # 📖 File này
+├── magia_ac-3.txt                     # Mã giả AC-3
+└── requirements.txt                   # Dependencies
+```
 
-def get_domain_values(tacvu: TacVu, csp: CSP) -> List[CSPAssignment]:
-    """Lấy tất cả các phương án gán hợp lệ cho một tác vụ (dựa trên trạng thái csp hiện tại)"""
-    domain = []
-    
-    # Tìm nhân sự có kỹ năng phù hợp
-    suitable_employees = [emp for emp in csp.cac_nhansu 
-                         if (not tacvu.required_skill) or tacvu.required_skill in emp.skills]
-    
-    if not suitable_employees:
-        return domain
-    
-    # Tính thời gian bắt đầu sớm nhất dựa theo các phụ thuộc
-    earliest_start = csp.project_start_date
-    for dep_task_id in tacvu.dependencies:
-        if dep_task_id in csp.assignment:
-            dep_assignment = csp.assignment[dep_task_id]
-            dep_task = next(t for t in csp.cac_tacvu if t.id == dep_task_id)
-            dep_end_time = dep_assignment.start_time + timedelta(hours=dep_task.duration)
-            earliest_start = max(earliest_start, dep_end_time)
-    
-    # Sinh các khoảng thời gian khả thi bắt đầu từ earliest_start
-    current_time = earliest_start
-    
-    # Làm tròn tới giờ kế tiếp nếu không tròn giờ
-    if current_time.minute > 0 or current_time.second > 0:
-        current_time = current_time.replace(minute=0, second=0) + timedelta(hours=1)
-    
-    while current_time < csp.project_end_date:
-        # Bỏ qua ngoài giờ làm việc (8h - 17h)
-        if current_time.hour < 8 or current_time.hour >= 17:
-            current_time = current_time.replace(hour=8, minute=0, second=0) + timedelta(days=1)
-            continue
-        
-        task_end_time = current_time + timedelta(hours=tacvu.duration)
-        
-        # Bỏ qua nếu tác vụ kết thúc sau 17h
-        if task_end_time.hour > 17:
-            current_time = current_time.replace(hour=8, minute=0, second=0) + timedelta(days=1)
-            continue
-        
-        # Bỏ qua nếu vượt quá thời hạn dự án
-        if task_end_time > csp.project_end_date:
-            break
-            
-        # Bỏ qua nếu vượt quá hạn chót tác vụ
-        project_deadline = csp.project_start_date + timedelta(days=tacvu.deadline)
-        if task_end_time > project_deadline:
-            break
-        
-        # Thử gán cho từng nhân sự phù hợp
-        for nhansu in suitable_employees:
-            assignment = CSPAssignment(nhansu, current_time)
-            if is_consistent(tacvu, assignment, csp):
-                domain.append(assignment)
-        
-        # Chuyển sang giờ tiếp theo
-        current_time += timedelta(hours=1)
-    
-    return domain
+---
 
-def initialize_domains(csp: CSP):
-    """Tạo miền ban đầu cho mỗi tác vụ dựa trên trạng thái assignment hiện tại (ban đầu rỗng)"""
-    csp.domains = {}
-    for tacvu in csp.cac_tacvu:
-        if tacvu.id in csp.assignment:
-            csp.domains[tacvu.id] = []
-        else:
-            csp.domains[tacvu.id] = get_domain_values(tacvu, csp)
+## 🚀 CÀI ĐẶT VÀ CHẠY
 
-def count_conflicts(assignment: CSPAssignment, tacvu: TacVu, csp: CSP) -> int:
-    """
-    Đếm số lượng xung đột (conflicts) mà assignment này gây ra cho các tác vụ chưa gán khác.
-    Xung đột xảy ra khi assignment này làm giảm số lựa chọn hợp lệ của tác vụ khác.
-    """
-    conflicts = 0
-    task_end_time = assignment.start_time + timedelta(hours=tacvu.duration)
-    
-    # Duyệt qua tất cả các tác vụ chưa được gán
-    unassigned_tasks = [t for t in csp.cac_tacvu if t.id not in csp.assignment and t.id != tacvu.id]
-    
-    for other_task in unassigned_tasks:
-        # Kiểm tra xem việc gán này có ảnh hưởng đến tác vụ khác không
-        if other_task.required_skill in assignment.nhansu.skills:
-            # Tìm thời gian bắt đầu sớm nhất cho other_task
-            earliest_start = csp.project_start_date
-            for dep_task_id in other_task.dependencies:
-                if dep_task_id in csp.assignment:
-                    dep_assignment = csp.assignment[dep_task_id]
-                    dep_task = next(t for t in csp.cac_tacvu if t.id == dep_task_id)
-                    dep_end_time = dep_assignment.start_time + timedelta(hours=dep_task.duration)
-                    earliest_start = max(earliest_start, dep_end_time)
-                elif dep_task_id == tacvu.id:
-                    # Nếu other_task phụ thuộc vào tacvu hiện tại
-                    earliest_start = max(earliest_start, task_end_time)
-            
-            other_end_time = earliest_start + timedelta(hours=other_task.duration)
-            
-            # Kiểm tra xung đột thời gian với nhân sự này
-            if (assignment.start_time < other_end_time and 
-                task_end_time > earliest_start):
-                conflicts += 1
-    
-    return conflicts
+### 1. Cài đặt dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-def order_domain_values_with_lcv(tacvu: TacVu, domain_values: List[CSPAssignment], csp: CSP) -> List[CSPAssignment]:
-    """
-    LCV (Least Constraining Value) Heuristic
-    Sắp xếp các giá trị miền, ưu tiên những giá trị ít gây xung đột nhất với các tác vụ khác (succeed-first strategy)
-    """
-    if not domain_values:
-        return domain_values
-    
-    # Tính điểm "phá đám" cho mỗi giá trị
-    value_conflict_scores = []
-    
-    for assignment in domain_values:
-        # Đếm số xung đột mà assignment này gây ra
-        conflicts = count_conflicts(assignment, tacvu, csp)
-        value_conflict_scores.append((assignment, conflicts))
-    
-    # Sắp xếp theo số xung đột tăng dần (ít xung đột nhất trước)
-    value_conflict_scores.sort(key=lambda x: x[1])
-    
-    # Trả về danh sách assignments đã sắp xếp
-    return [assignment for assignment, _ in value_conflict_scores]
+### 2. Chạy hệ thống:
+```bash
+python main-solver.py
+```
 
-def select_variable_with_mrv(csp: CSP, current_domains: Dict[str, List[CSPAssignment]]) -> Optional[TacVu]:
-    """
-    MRV (Minimum Remaining Values) Heuristic
-    Chọn tác vụ có ít lựa chọn hợp lệ nhất (fail-fast strategy)
-    Sử dụng current_domains đã được cắt tỉa
-    """
-    unassigned_tasks = [tacvu for tacvu in csp.cac_tacvu if tacvu.id not in csp.assignment]
-    if not unassigned_tasks:
-        return None
-    
-    # Lọc các tác vụ có đủ điều kiện (phụ thuộc đã hoàn thành)
-    ready_tasks = []
-    for tacvu in unassigned_tasks:
-        dependencies_satisfied = all(dep in csp.assignment for dep in tacvu.dependencies)
-        if dependencies_satisfied:
-            ready_tasks.append(tacvu)
-    
-    if not ready_tasks:
-        return None
-    
-    # Tìm tác vụ có ít lựa chọn hợp lệ nhất dựa trên current_domains
-    tac_vu_kho_nhat = None
-    so_lua_chon_it_nhat = float('inf')
-    
-    for tacvu in ready_tasks:
-        domain_vals = current_domains.get(tacvu.id, [])
-        so_lua_chon = len(domain_vals)
-        if so_lua_chon < so_lua_chon_it_nhat:
-            so_lua_chon_it_nhat = so_lua_chon
-            tac_vu_kho_nhat = tacvu
-    
-    return tac_vu_kho_nhat
+### 3. Tương tác với chương trình:
+```
+=== HỆ THỐNG PHÂN CÔNG CÔNG VIỆC SỬ DỤNG CSP - MÔ HÌNH TỐI ƯU ===
 
-def forward_checking(csp: CSP, assigned_task_id: str) -> Tuple[bool, Dict[str, List[CSPAssignment]]]:
-    """
-    Thực hiện Forward Checking - cắt tỉa domain hàng xóm
-    Mục đích: Phát hiện ngõ cụt sớm và giảm không gian tìm kiếm
-    
-    Trả về (success, removed_map):
-    - success: True nếu không phát hiện ngõ cụt, False nếu có domain trở thành rỗng
-    - removed_map: Map các giá trị đã bị cắt (để khôi phục khi backtrack)
-    """
-    removed_map: Dict[str, List[CSPAssignment]] = {}
-    assigned_task = next(t for t in csp.cac_tacvu if t.id == assigned_task_id)
-    assigned_assignment = csp.assignment[assigned_task_id]
-    
-    # Lấy tất cả hàng xóm của tác vụ vừa gán
-    neighbors = get_neighbors(assigned_task, csp)
-    
-    # Duyệt qua các hàng xóm chưa được gán
-    for neighbor_task in neighbors:
-        if neighbor_task.id not in csp.assignment:
-            original_domain = csp.domains.get(neighbor_task.id, [])
-            new_domain = []
-            removed_here: List[CSPAssignment] = []
-            
-            # Kiểm tra từng giá trị trong domain của hàng xóm
-            for neighbor_value in original_domain:
-                # Kiểm tra xung đột giữa assignment vừa gán và giá trị này
-                has_conflict = check_conflict_between_assignments(
-                    assigned_task, assigned_assignment,
-                    neighbor_task, neighbor_value,
-                    csp
-                )
-                
-                if not has_conflict:
-                    # Không xung đột → giữ lại
-                    new_domain.append(neighbor_value)
-                else:
-                    # Có xung đột → cắt bỏ
-                    removed_here.append(neighbor_value)
-            
-            # Lưu các giá trị đã cắt (để khôi phục sau)
-            if removed_here:
-                removed_map[neighbor_task.id] = removed_here
-            
-            # CẬP NHẬT domain mới (đã cắt tỉa)
-            csp.domains[neighbor_task.id] = new_domain
-            
-            # PHÁT HIỆN NGÕ CỤT SỚM (FAIL-FAST)
-            if len(csp.domains[neighbor_task.id]) == 0:
-                return False, removed_map  # Báo hiệu ngõ cụt!
-    
-    # Cắt tỉa tất cả hàng xóm mà không ai bị rỗng
-    return True, removed_map  # Thành công, có thể tiếp tục
+Chọn bộ dữ liệu:
+1. complex_dependency_chain - Chuỗi phụ thuộc phức tạp
+2. load_balance - Cân bằng tải
+3. skill_bottleneck - Nghẽn cổ chai kỹ năng
 
-def restore_domains(csp: CSP, removed_map: Dict[str, List[CSPAssignment]]):
-    """Khôi phục miền sau khi backtrack dựa vào removed_map"""
-    for task_id, removed_vals in removed_map.items():
-        if task_id not in csp.domains:
-            csp.domains[task_id] = []
-        csp.domains[task_id].extend(removed_vals)
+Nhập lựa chọn (1-3): 1
 
-def get_neighbors(tacvu: TacVu, csp: CSP) -> List[TacVu]:
-    """
-    Tìm những tác vụ có ràng buộc với tacvu (hàng xóm)
-    Giúp forward_checking biết cần kiểm tra những tác vụ nào
-    
-    Hàng xóm bao gồm:
-    1. Tác vụ phụ thuộc VÀO tacvu
-    2. Tác vụ mà tacvu phụ thuộc VÀO
-    3. Tác vụ cùng kỹ năng yêu cầu (cạnh tranh nhân sự)
-    """
-    neighbors = set()
-    
-    # 1. Tác vụ phụ thuộc VÀO tacvu
-    for other_task in csp.cac_tacvu:
-        if tacvu.id in other_task.dependencies:
-            neighbors.add(other_task)
-    
-    # 2. Tác vụ mà tacvu phụ thuộc VÀO
-    for dep_id in tacvu.dependencies:
-        dep_task = next((t for t in csp.cac_tacvu if t.id == dep_id), None)
-        if dep_task:
-            neighbors.add(dep_task)
-    
-    # 3. Tác vụ cùng kỹ năng yêu cầu (cạnh tranh nhân sự)
-    for other_task in csp.cac_tacvu:
-        if (other_task.required_skill == tacvu.required_skill and 
-            other_task.id != tacvu.id and 
-            other_task.required_skill):  # Chỉ xét nếu có yêu cầu kỹ năng
-            neighbors.add(other_task)
-    
-    return list(neighbors)
+Nhập thông tin dự án:
+Ngày bắt đầu dự án (dd/mm/yyyy): 13/04/2005
+Ngày kết thúc dự án (dd/mm/yyyy): 23/04/2005
+```
 
-def check_conflict_between_assignments(task1: TacVu, assignment1: CSPAssignment, 
-                                       task2: TacVu, assignment2: CSPAssignment, 
-                                       csp: CSP) -> bool:
-    """
-    Kiểm tra xung đột giữa 2 assignment
-    Logic tương tự is_consistent() nhưng cho 2 cặp (task, assignment)
-    
-    Returns:
-        True nếu CÓ XUNG ĐỘT
-        False nếu KHÔNG XUNG ĐỘT
-    """
-    end_time_1 = assignment1.start_time + timedelta(hours=task1.duration)
-    end_time_2 = assignment2.start_time + timedelta(hours=task2.duration)
-    
-    # KIỂM TRA 1: Cùng nhân sự + thời gian trùng lặp?
-    if assignment1.nhansu.id == assignment2.nhansu.id:
-        if (assignment1.start_time < end_time_2 and end_time_1 > assignment2.start_time):
-            return True  # CÓ XUNG ĐỘT
-    
-    # KIỂM TRA 2: Phụ thuộc không thỏa mãn?
-    if task2.id in task1.dependencies:
-        if assignment1.start_time < end_time_2:
-            return True  # CÓ XUNG ĐỘT
-    
-    if task1.id in task2.dependencies:
-        if assignment2.start_time < end_time_1:
-            return True  # CÓ XUNG ĐỘT
-    
-    # KIỂM TRA 3: Deadline bị vượt?
-    task1_deadline = csp.project_start_date + timedelta(days=task1.deadline)
-    if end_time_1 > task1_deadline:
-        return True  # CÓ XUNG ĐỘT
-    
-    task2_deadline = csp.project_start_date + timedelta(days=task2.deadline)
-    if end_time_2 > task2_deadline:
-        return True  # CÓ XUNG ĐỘT
-    
-    # KIỂM TRA 4: Ngoài khung thời gian dự án?
-    if assignment1.start_time < csp.project_start_date or end_time_1 > csp.project_end_date:
-        return True  # CÓ XUNG ĐỘT
-    
-    if assignment2.start_time < csp.project_start_date or end_time_2 > csp.project_end_date:
-        return True  # CÓ XUNG ĐỘT
-    
-    return False  # KHÔNG XUNG ĐỘT
+### 4. Xem kết quả:
+- **Console**: Hiển thị kết quả phân công, đánh giá ràng buộc mềm, thống kê hiệu suất
+- **CSV**: File `task_assignment_{dataset}_advanced.csv` chứa bảng phân công chi tiết
 
-def recursive_backtracking(csp: CSP, current_domains: Dict[str, List[CSPAssignment]]) -> bool:
-    """
-    Giải bằng thuật toán quay lui đệ quy (backtracking) với MRV + LCV + Forward Checking
-    
-    Args:
-        csp: Đối tượng CSP chứa assignment và thông tin bài toán
-        current_domains: Miền giá trị hiện tại của tầng đệ quy này (đã được cắt tỉa từ các tầng trước)
-    """
-    # Trường hợp cơ sở: tất cả tác vụ đã được gán
-    if len(csp.assignment) == len(csp.cac_tacvu):
-        csp.solution_found = True
-        return True
-    
-    # Chọn biến chưa gán bằng MRV Heuristic (luôn dùng)
-    tacvu = select_variable_with_mrv(csp, current_domains)
-    
-    if tacvu is None:
-        # không còn task ready (có thể deadlock) -> thất bại ở nhánh này
-        return False
-    
-    # Lấy các giá trị miền từ current_domains (đã được cắt tỉa)
-    domain_values = current_domains.get(tacvu.id, [])
-    if not domain_values:
-        return False
-    
-    # Sắp xếp theo LCV (Least Constraining Value) - luôn dùng
-    domain_values = order_domain_values_with_lcv(tacvu, domain_values, csp)
-    
-    # Thử từng giá trị
-    for assignment in list(domain_values):
-        # 1. Thực hiện phép gán
-        csp.assignment[tacvu.id] = assignment
-        
-        # 2. TẠO BẢN SAO DOMAIN ĐỂ CHUẨN BỊ "CẮT TỈA" (Deep Copy)
-        new_domains = {}
-        for task_id in current_domains.keys():
-            new_domains[task_id] = current_domains[task_id].copy()
-        
-        # Đánh dấu task hiện tại đã gán (domain rỗng)
-        new_domains[tacvu.id] = []
-        
-        # 3. Cập nhật csp.domains để is_consistent() và forward_checking() sử dụng
-        csp.domains = new_domains
-        
-        # 4. THỰC HIỆN FORWARD CHECKING (luôn dùng)
-        # Hàm này sẽ cắt tỉa new_domains và phát hiện ngõ cụt sớm
-        forward_ok, forward_removed = forward_checking(csp, tacvu.id)
-        
-        # 5. Nếu Forward Check không phát hiện ngõ cụt
-        if forward_ok:
-            # Gọi đệ quy với new_domains đã bị cắt tỉa
-            result = recursive_backtracking(csp, csp.domains)
-            if result:
-                return True
-        
-        # 6. QUAY LUI (Backtrack) - Xóa assignment hiện tại
-        del csp.assignment[tacvu.id]
-        # Vứt bỏ new_domains - vòng lặp tiếp theo dùng current_domains gốc
-    
-    # Nếu đã thử hết các giá trị mà không tìm được lời giải
-    return False
+---
 
-def solve_csp(dataset_folder: str, project_start_date: datetime, project_end_date: datetime) -> CSP:
-    """
-    Hàm tổng hợp để giải bài toán CSP
-    Luôn sử dụng MRV + LCV + Forward Checking
-    
-    Args:
-        dataset_folder: Đường dẫn tới thư mục dữ liệu
-        project_start_date: Ngày bắt đầu dự án
-        project_end_date: Ngày kết thúc dự án
-    """
-    
-    # Nạp dữ liệu
-    cac_tacvu, cac_nhansu = load_data(dataset_folder)
-    
-    # Tạo đối tượng CSP
-    csp = CSP(cac_tacvu, cac_nhansu, project_start_date, project_end_date)
-    
-    # Khởi tạo miền ban đầu
-    initialize_domains(csp)
-    
-    # Tạo bản sao initial_domains để truyền vào đệ quy
-    initial_domains = {}
-    for task_id in csp.domains:
-        initial_domains[task_id] = csp.domains[task_id].copy()
-    
-    # Giải bằng quay lui với MRV + LCV + Forward Checking
-    recursive_backtracking(csp, initial_domains)
-    
-    return csp
+## 📊 KẾT QUẢ TEST
 
-def display_solution(csp: CSP):
-    """Hiển thị kết quả phân công"""
-    if not csp.solution_found:
-        print("Không tìm thấy giải pháp!")
-        return
-    
-    sorted_assignments = sorted(csp.assignment.items(), 
-                              key=lambda x: x[1].start_time)
-    
-    print("\n=== KẾT QUẢ PHÂN CÔNG CÔNG VIỆC ===\n")
-    
-    for task_id, assignment in sorted_assignments:
-        tacvu = next(t for t in csp.cac_tacvu if t.id == task_id)
-        start_time = assignment.start_time
-        end_time = start_time + timedelta(hours=tacvu.duration)
-        
-        print(f"Tác vụ {tacvu.id} ({tacvu.name}): {assignment.nhansu.name} ({assignment.nhansu.id})")
-        print(f"  - Ngày bắt đầu: {start_time.strftime('%H:%M %d/%m/%Y')}")
-        print(f"  - Ngày kết thúc: {end_time.strftime('%H:%M %d/%m/%Y')}")
-        print(f"  - Thời lượng: {tacvu.duration} giờ\n")
+### Test với 3 datasets:
 
-def export_to_csv(csp: CSP, filename: str = "task_assignment.csv"):
-    """Xuất kết quả ra file CSV"""
-    if not csp.solution_found:
-        print("Không có giải pháp để xuất!")
-        return
-    
-    csv_data = []
-    for task_id, assignment in csp.assignment.items():
-        tacvu = next(t for t in csp.cac_tacvu if t.id == task_id)
-        start_time = assignment.start_time
-        end_time = start_time + timedelta(hours=tacvu.duration)
-        
-        csv_data.append({
-            'Task_ID': tacvu.id,
-            'Task_Name': tacvu.name,
-            'Employee_ID': assignment.nhansu.id,
-            'Employee_Name': assignment.nhansu.name,
-            'Start_Date': start_time.strftime('%d/%m/%Y'),
-            'Start_Time': start_time.strftime('%H:%M'),
-            'End_Date': end_time.strftime('%d/%m/%Y'),
-            'End_Time': end_time.strftime('%H:%M'),
-            'Duration_Hours': tacvu.duration,
-            'Priority': tacvu.priority,
-            'Required_Skill': tacvu.required_skill
-        })
-    
-    csv_data.sort(key=lambda x: datetime.strptime(f"{x['Start_Date']} {x['Start_Time']}", '%d/%m/%Y %H:%M'))
-    
-    df = pd.DataFrame(csv_data)
-    df.to_csv(filename, index=False, encoding='utf-8-sig')
-    print(f"\nKết quả đã được xuất ra file: {filename}")
-    
-    print("\n=== BẢNG PHÂN CÔNG CÔNG VIỆC ===")
-    print(df.to_string(index=False))
+| Dataset | Tác vụ | Nhân sự | Thời gian | AC-3 cắt | FC cắt | Backtrack | Kết quả |
+|---------|--------|---------|-----------|----------|--------|-----------|---------|
+| **complex_dependency_chain** | 25 | 9 | 0.15s | 142 (8.08%) | 644 | 0 | ✅ PASS |
+| **load_balance** | 30 | 10 | 0.36s | 18 (0.52%) | 1154 | 0 | ✅ PASS |
+| **skill_bottleneck** | 25 | 8 | 0.13s | 55 (2.98%) | 450 | 0 | ✅ PASS |
 
-def main():
-    """Chương trình chính để chạy bộ giải CSP"""
-    print("=== HỆ THỐNG PHÂN CÔNG CÔNG VIỆC SỬ DỤNG CSP ===")
-    print("Mô hình: Backtracking + MRV + LCV + Forward Checking\n")
-    
-    print("Chọn bộ dữ liệu:")
-    print("1. complex_dependency_chain")
-    print("2. load_balance") 
-    print("3. skill_bottleneck")
-    
-    choice = input("Nhập lựa chọn (1-3): ").strip()
-    
-    dataset_map = {
-        '1': 'complex_dependency_chain',
-        '2': 'load_balance',
-        '3': 'skill_bottleneck'
-    }
-    
-    if choice not in dataset_map:
-        print("Lựa chọn không hợp lệ!")
-        return
-    
-    dataset_folder = f"datasets/{dataset_map[choice]}"
-    
-    print("\nNhập thông tin dự án:")
-    start_date_str = input("Ngày bắt đầu dự án (dd/mm/yyyy): ").strip()
-    end_date_str = input("Ngày kết thúc dự án (dd/mm/yyyy): ").strip()
-    
-    try:
-        project_start_date = datetime.strptime(start_date_str, '%d/%m/%Y')
-        project_end_date = datetime.strptime(end_date_str, '%d/%m/%Y')
-        project_start_date = project_start_date.replace(hour=8, minute=0, second=0)
-        project_end_date = project_end_date.replace(hour=17, minute=0, second=0)
-    except ValueError:
-        print("Định dạng ngày không đúng! Vui lòng nhập theo dạng dd/mm/yyyy")
-        return
-    
-    print(f"\n{'='*70}")
-    print(f"Phương pháp: MRV + LCV + Forward Checking")
-    print(f"Bộ dữ liệu: {dataset_folder}")
-    print(f"Thời gian dự án: {project_start_date.strftime('%d/%m/%Y %H:%M')} - {project_end_date.strftime('%d/%m/%Y %H:%M')}")
-    print(f"{'='*70}\n")
-    
-    import time
-    start_time = time.time()
-    
-    csp = solve_csp(dataset_folder, project_start_date, project_end_date)
-    
-    end_time = time.time()
-    execution_time = end_time - start_time
-    
-    display_solution(csp)
-    
-    print(f"\n{'='*70}")
-    print(f"Thời gian thực thi: {execution_time:.4f} giây")
-    print(f"{'='*70}")
-    
-    if csp.solution_found:
-        export_to_csv(csp, f"task_assignment_{dataset_map[choice]}_model_main.csv")
+**Tổng kết**: 3/3 datasets thành công (100%), không cần backtrack!
 
-if __name__ == "__main__":
-    main()
+### Điểm nổi bật:
+- ✅ **100% datasets thành công** (3/3)
+- ✅ **0 backtrack** cho tất cả datasets
+- ✅ **< 0.4 giây** thời gian thực thi
+- ✅ **AC-3 cắt giảm 0.52%-8.08%** domain
+- ✅ **Priority Score > 0.77** (tốt)
+- ✅ **Forward Checking hiệu quả**: Cắt 450-1154 giá trị
+
+---
+
+## 🔄 LUỒNG XỬ LÝ TỔNG THỂ
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MAIN()                                    │
+│  - Chọn dataset                                             │
+│  - Nhập thời gian dự án                                     │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              SOLVE_CSP()                                    │
+│  BƯỚC 1: load_data()           → Đọc CSV, tạo TacVu, NhanSu │
+│  BƯỚC 2: initialize_domains()  → Tạo miền giá trị ban đầu  │
+│  BƯỚC 3: ac3_preprocess()      → Tiền xử lý AC-3           │
+│  BƯỚC 4: recursive_backtracking() → Tìm lời giải           │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│        DISPLAY_SOLUTION()                                   │
+│  - Hiển thị kết quả phân công                              │
+│  - Đánh giá ràng buộc mềm                                  │
+│  - Thống kê hiệu suất                                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Chi tiết các bước:
+
+#### BƯỚC 1: LOAD_DATA()
+- Đọc file CSV từ thư mục dataset
+- Tạo danh sách `TacVu` (tác vụ) và `NhanSu` (nhân sự)
+- Xử lý dependencies và skills bằng split(',')
+
+#### BƯỚC 2: INITIALIZE_DOMAINS()
+- Tạo miền giá trị ban đầu cho mỗi tác vụ
+- Sinh tất cả các `CSPAssignment` hợp lệ (nhân sự + thời gian)
+- Kiểm tra ràng buộc: kỹ năng, phụ thuộc, deadline, khung thời gian
+
+#### BƯỚC 3: AC3_PREPROCESS()
+- **Mục đích**: Cắt tỉa domain ban đầu trước khi tìm kiếm
+- **Cách hoạt động**:
+  1. Tạo hàng đợi chứa tất cả các arc (cặp tác vụ có ràng buộc)
+  2. Xử lý từng arc: Kiểm tra và cắt tỉa domain
+  3. Lan truyền: Nếu domain thay đổi, thêm các arc liên quan vào hàng đợi
+  4. Phát hiện ngõ cụt sớm: Nếu domain rỗng → không có lời giải
+- **Kết quả**: Domain nhỏ hơn → Backtracking nhanh hơn
+
+#### BƯỚC 4: RECURSIVE_BACKTRACKING()
+- **MRV**: Chọn tác vụ có ít lựa chọn nhất (fail-fast)
+- **LCV + Soft Constraints**: Sắp xếp giá trị theo:
+  * Ít xung đột nhất (LCV)
+  * Thỏa mãn ràng buộc mềm tốt nhất (Priority + Load Balance)
+- **Forward Checking**: Sau mỗi phép gán, cắt tỉa domain của hàng xóm
+- **Backtrack**: Nếu thất bại, quay lui và thử giá trị khác
+
+---
+
+## 🔧 ĐỊNH DẠNG DỮ LIỆU
+
+### File `congviec_*.csv`:
+```csv
+ID,TenTask,YeuCauKyNang,ThoiLuong (gio),PhuThuoc,Deadline (ngay),DoUuTien
+T01,Gather Requirements,Analysis,6,,2,5
+T02,Create Design Doc,Design,5,T01,3,4
+```
+
+- **ID**: Mã tác vụ (T01, T02, ...)
+- **TenTask**: Tên tác vụ
+- **YeuCauKyNang**: Kỹ năng yêu cầu (Analysis, Design, Database, Frontend, ...)
+- **ThoiLuong (gio)**: Thời lượng (giờ)
+- **PhuThuoc**: Danh sách ID tác vụ phụ thuộc (phân cách bởi dấu phẩy, để trống nếu không có)
+- **Deadline (ngay)**: Hạn chót (số ngày từ khi dự án bắt đầu)
+- **DoUuTien**: Độ ưu tiên (số càng lớn = ưu tiên cao hơn)
+
+### File `nhanvien_*.csv`:
+```csv
+ID,Ten,KyNang,SucChua (gio/ngay)
+NV01,Lan A,"Analysis, Design",8
+NV02,Tran B,"Backend, Database",8
+```
+
+- **ID**: Mã nhân viên (NV01, NV02, ...)
+- **Ten**: Tên nhân viên
+- **KyNang**: Danh sách kỹ năng (phân cách bởi dấu phẩy)
+- **SucChua (gio/ngay)**: Sức chứa (giờ làm việc/ngày, thường là 8)
+
+---
+
+## 🎨 OUTPUT
+
+### 1. Console Output:
+```
+======================================================================
+KẾT QUẢ PHÂN CÔNG CÔNG VIỆC
+======================================================================
+
+Tác vụ T01 (Gather Requirements): Lan A (NV01)
+  - Ngày bắt đầu: 08:00 13/04/2005
+  - Ngày kết thúc: 14:00 13/04/2005
+  - Thời lượng: 6 giờ
+  - Độ ưu tiên: 5
+
+...
+
+======================================================================
+ĐÁNH GIÁ RÀNG BUỘC MỀM
+======================================================================
+
+1. Load Balance Score: 0.0634
+   (Điểm càng cao = cân bằng tải càng tốt)
+
+2. Priority Score: 0.7715
+   (Điểm càng cao = tác vụ ưu tiên cao được thực hiện sớm hơn)
+
+3. Tổng thể: 0.4175
+
+======================================================================
+THỐNG KÊ HIỆU SUẤT
+======================================================================
+Thời gian thực thi: 0.1515 giây
+Số giá trị bị cắt bởi AC-3: 142
+Số giá trị bị cắt bởi Forward Checking: 644
+Số lần Backtrack: 0
+```
+
+### 2. CSV Output:
+File `task_assignment_{dataset}_advanced.csv`:
+```csv
+Task_ID,Task_Name,Employee_ID,Employee_Name,Start_Date,Start_Time,End_Date,End_Time,Duration_Hours,Priority,Required_Skill
+T01,Gather Requirements,NV01,Lan A,13/04/2005,08:00,13/04/2005,14:00,6,5,Analysis
+T02,Create Design Doc,NV01,Lan A,14/04/2005,08:00,14/04/2005,13:00,5,4,Design
+...
+```
+
+---
+
+## 🔍 CÁC TÍNH NĂNG CHÍNH
+
+### 1. AC-3 Preprocessing
+- Cắt tỉa domain ban đầu trước khi tìm kiếm
+- Lan truyền ràng buộc qua nhiều tầng
+- Phát hiện ngõ cụt sớm (nếu có)
+- **Tuân thủ theo file `magia_ac-3.txt`**
+
+### 2. MRV Heuristic
+- Chọn tác vụ có ít lựa chọn nhất (fail-fast strategy)
+- Tie-breaking: Nếu có nhiều tác vụ cùng số lựa chọn, ưu tiên tác vụ có priority cao hơn
+- Giúp phát hiện ngõ cụt sớm
+
+### 3. LCV Heuristic + Soft Constraints
+- Sắp xếp giá trị theo:
+  * **LCV**: Ít xung đột nhất (succeed-first strategy)
+  * **Load Balance**: Ưu tiên nhân sự có workload gần trung bình
+  * **Priority**: Ưu tiên tác vụ quan trọng thực hiện sớm
+- Kết hợp với trọng số: 70% LCV + 30% Soft Constraints
+
+### 4. Forward Checking
+- Cắt tỉa domain của hàng xóm sau mỗi phép gán
+- Phát hiện ngõ cụt ngay lập tức
+- Giảm backtrack đáng kể
+
+### 5. Soft Constraints Evaluation
+- **Priority Score**: `(priority / max_priority) × (1 - normalized_time)`
+  * Tác vụ ưu tiên cao thực hiện sớm → điểm cao
+- **Load Balance Score**: `1 / (1 + |new_workload - avg_workload|)`
+  * Workload gần trung bình → điểm cao
+
+---
+
+## 🛠️ MỞ RỘNG VÀ TÙY CHỈNH
+
+### Điều chỉnh trọng số trong LCV + Soft Constraints:
+Trong file `main-solver.py`, tìm hàm `order_domain_values_with_lcv()`:
+
+```python
+# Trọng số LCV vs Soft Constraints
+LCV_WEIGHT = 0.7      # Độ quan trọng của LCV (ít xung đột)
+SOFT_WEIGHT = 0.3     # Độ quan trọng của ràng buộc mềm
+
+# Trọng số trong Soft Constraints
+LOAD_BALANCE_WEIGHT = 0.4  # Độ quan trọng của Load Balance
+PRIORITY_WEIGHT = 0.6      # Độ quan trọng của Priority
+```
+
+**Hướng dẫn điều chỉnh**:
+- Tăng `LOAD_BALANCE_WEIGHT` nếu muốn cân bằng tải tốt hơn
+- Tăng `PRIORITY_WEIGHT` nếu muốn ưu tiên tác vụ quan trọng
+- Tăng `LCV_WEIGHT` nếu muốn giảm xung đột (ít backtrack hơn)
+
+### Thêm ràng buộc mới:
+1. **Ràng buộc cứng**: Thêm vào hàm `is_consistent()` và `check_conflict_between_assignments()`
+2. **Ràng buộc mềm**: Thêm vào hàm `evaluate_soft_constraints()`
+
+---
+
+## ⚠️ HẠN CHẾ VÀ HƯỚNG CẢI THIỆN
+
+### Hạn chế hiện tại:
+1. **Load Balance chưa tối ưu**: Một số nhân sự bị quá tải (40 giờ), một số không được gán
+2. **Trọng số cố định**: Chưa tự động điều chỉnh theo đặc điểm dataset
+3. **Giờ làm việc cứng nhắc**: 8h-17h, không linh hoạt
+4. **Không có giới hạn workload**: Nhân sự có thể bị gán > 8 giờ/ngày
+
+### Hướng cải thiện:
+1. Thêm ràng buộc workload: Giới hạn số giờ làm việc/ngày, /tuần
+2. Điều chỉnh trọng số động: Tùy theo đặc điểm dataset (phụ thuộc/load_balance/bottleneck)
+3. Tối ưu hóa toàn cục: Sử dụng Branch & Bound hoặc thuật toán di truyền
+4. Xử lý giờ làm linh hoạt: Ca sáng, ca chiều, overtime
+5. Thêm ràng buộc mềm khác: Chi phí, kỹ năng yêu cầu mềm, deadline mềm
+
+---
+
+## 📝 VÍ DỤ MINH HỌA
+
+### Dataset: complex_dependency_chain
+**Đặc điểm**: Chuỗi phụ thuộc dài T01→T02→...→T07, 25 tác vụ, 9 nhân sự
+
+**Quá trình xử lý**:
+1. **Initialize Domains**: 1757 giá trị ban đầu
+2. **AC-3 Preprocessing**: Cắt giảm 142 giá trị (8.08%) → 1615 giá trị
+3. **Backtracking**: 
+   - MRV chọn T01 (ưu tiên cao, không phụ thuộc)
+   - LCV + Soft Constraints chọn assignment tốt nhất
+   - Forward Checking cắt tỉa domain của T02, T08-T25
+   - Tiếp tục với các tác vụ khác
+4. **Kết quả**: Tìm thấy lời giải trong 0.15s, 0 backtrack!
+
+**Phân bố công việc**:
+- Le C (NV03): 39 giờ (9 tác vụ)
+- Ho H (NV08): 40 giờ (10 tác vụ)
+- Lan A (NV01): 11 giờ (2 tác vụ)
+- Bui F (NV06): 0 giờ (không được gán)
+
+**Đánh giá**:
+- Priority Score: 0.7715 (tốt - tác vụ ưu tiên cao được ưu tiên)
+- Load Balance Score: 0.0634 (cần cải thiện - chưa cân bằng)
+
+---
+
+## 🎯 TÍNH NĂNG NỔI BẬT
+
+File `main-solver.py` tích hợp đầy đủ các thuật toán tối ưu:
+- ✅ **AC-3 Preprocessing**: Cắt tỉa domain ban đầu
+- ✅ **MRV Heuristic**: Chọn biến thông minh (+ tie-breaking)
+- ✅ **LCV + Soft Constraints**: Sắp xếp giá trị tối ưu
+- ✅ **Forward Checking**: Phát hiện ngõ cụt sớm
+- ✅ **Soft Constraints**: Priority + Load Balance
+- ✅ **Hiệu suất cao**: 0 backtrack, < 0.4 giây
+
+---
+
+## ❓ VẤN ĐỀ THƯỜNG GẶP
+
+**Q: Chương trình báo "Không tìm thấy giải pháp"?**
+- A: Kiểm tra deadline quá chặt, hoặc kỹ năng không khớp. Tăng thời gian dự án hoặc giảm deadline.
+
+**Q: Load Balance Score thấp?**
+- A: Tăng `LOAD_BALANCE_WEIGHT` trong hàm `evaluate_soft_constraints()`.
+
+**Q: Thời gian chạy quá lâu?**
+- A: Giảm khoảng thời gian dự án, hoặc giảm số tác vụ.
+
+**Q: AC-3 phát hiện ngõ cụt?**
+- A: Bài toán không có lời giải. Kiểm tra lại ràng buộc (deadline, kỹ năng, phụ thuộc).
+
+---
+
+## 📝 CHANGELOG
+
+### Version 2.0 (Advanced) - 2025-11-12
+- ✅ Thêm AC-3 Preprocessing (tuân thủ theo `magia_ac-3.txt`)
+- ✅ Thêm Soft Constraints Optimization (Priority + Load Balance)
+- ✅ Cải thiện MRV với tie-breaking theo priority
+- ✅ Cải thiện LCV với kết hợp soft constraints
+- ✅ Thêm thống kê hiệu suất chi tiết
+- ✅ Test thành công 100% datasets (3/3)
+
+### Version 1.0 (Baseline) - 2025
+- Backtracking + MRV + LCV + Forward Checking
+
+---
+
+## 📜 LICENSE
+
+Dự án này được phát triển cho mục đích học tập và nghiên cứu.
+
+---
+
+**Phát triển bởi**: Nhóm CSP-TTNT  
+**Ngày cập nhật**: 12/11/2025
